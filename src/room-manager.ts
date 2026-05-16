@@ -1,13 +1,4 @@
-import {
-	GameConfig,
-	Player,
-	PublicPlayer,
-	PublicRoom,
-	PublicTeam,
-	Room,
-	Team,
-	TeamColor,
-} from "./types";
+import { GameConfig, Player, PublicPlayer, PublicRoom, PublicTeam, Room, TeamColor } from "./types";
 
 const rooms = new Map<string, Room>();
 const CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -112,7 +103,7 @@ export function joinTeam(code: string, playerId: string, teamColor: TeamColor): 
 	return room;
 }
 
-export function leaceRoom(code: string, playerId: string): Room | null {
+export function leaveRoom(code: string, playerId: string): Room | null {
 	const room = rooms.get(code);
 	if (!room) return null;
 
