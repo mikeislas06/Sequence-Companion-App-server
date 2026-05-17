@@ -47,6 +47,7 @@ export interface Room {
 	discardPile: Card[];
 	lastPlayedCard?: Card;
 	winnerTeam?: TeamColor;
+	sequences: Record<TeamColor, number>;
 	timerRef?: ReturnType<typeof setInterval>;
 }
 
@@ -60,6 +61,8 @@ export interface PublicRoom {
 	currentPlayerId?: string;
 	deckCount?: number;
 	lastPlayedCard?: Card;
+	sequences: Record<TeamColor, number>;
+	winnerTeam?: TeamColor;
 }
 
 export interface PublicTeam {

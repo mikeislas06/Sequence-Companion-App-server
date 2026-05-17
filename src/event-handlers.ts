@@ -5,6 +5,7 @@ import {
 	joinRoom,
 	joinTeam,
 	leaveRoom,
+	resetRoom,
 	canStartGame,
 	toPublicRoom,
 	setRoom,
@@ -216,6 +217,54 @@ export function registerHandlers(io: Server): void {
 				for (const player of room.teams[payload.targetTeam].players) {
 					io.to(player.id).emit("hand:updated", { hand: player.hand });
 				}
+			} catch (e) {
+				socket.emit("error", { message: (e as Error).message });
+			}
+		});
+
+		socket.on(
+			"sequence:update",
+			({ roomCode, teamColor, delta }: { roomCode: string; teamColor: TeamColor; delta: 1 | -1 }) => {
+				try {
+					const room = getRoom(roomCode);
+					if (!room) throw new Error("Room not found");
+					if (socket.id !== room.hostId) throw new Error("Only the host can update sequences");
+					if (room.status !== "in_game") throw new Error("Game not in progress");
+
+					room.sequences[teamColor] = Math.max(0, (room.sequences[teamColor] ?? 0) + delta);
+
+					const winCount = room.config.teamCount === 2 ? 2 : 1;
+					const activeColors: TeamColor[] =
+						room.config.teamCount === 2 ? ["green", "blue"] : ["green", "blue", "red"];
+					const winner = activeColors.find((c) => room.sequences[c] >= winCount);
+
+					if (winner) {
+						room.winnerTeam = winner;
+						room.status = "game_over";
+						if (room.timerRef) clearInterval(room.timerRef);
+					}
+
+					setRoom(room);
+					broadcast(io, roomCode, room);
+
+					if (winner) {
+						io.to(roomCode).emit("game:over", { winnerTeam: winner });
+					}
+				} catch (e) {
+					socket.emit("error", { message: (e as Error).message });
+				}
+			},
+		);
+
+		socket.on("game:reset", ({ roomCode }: { roomCode: string }) => {
+			try {
+				const room = getRoom(roomCode);
+				if (!room) throw new Error("Room not found");
+				if (socket.id !== room.hostId) throw new Error("Only the host can reset the game");
+
+				const reset = resetRoom(roomCode);
+				broadcast(io, roomCode, reset);
+				io.to(roomCode).emit("game:reset");
 			} catch (e) {
 				socket.emit("error", { message: (e as Error).message });
 			}

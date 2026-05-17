@@ -54,6 +54,7 @@ export function createRoom(hostId: string, hostName: string, config: GameConfig)
 		currentTurnIndex: 0,
 		deck: [],
 		discardPile: [],
+		sequences: { green: 0, blue: 0, red: 0 },
 	};
 
 	rooms.set(code, room);
@@ -182,7 +183,36 @@ export function toPublicRoom(room: Room): PublicRoom {
 		currentPlayerId: room.turnOrder[room.currentTurnIndex],
 		deckCount: room.config.showDeckCount ? room.deck.length : undefined,
 		lastPlayedCard: room.lastPlayedCard,
+		sequences: room.sequences,
+		winnerTeam: room.winnerTeam,
 	};
+}
+
+export function resetRoom(code: string): Room {
+	const room = rooms.get(code);
+	if (!room) throw new Error("Room not found");
+
+	if (room.timerRef) clearInterval(room.timerRef);
+
+	for (const team of Object.values(room.teams)) {
+		for (const player of team.players) {
+			player.hand = [];
+			player.handLimit = 0;
+		}
+	}
+
+	room.status = "lobby";
+	room.deck = [];
+	room.discardPile = [];
+	room.turnOrder = [];
+	room.currentTurnIndex = 0;
+	room.sequences = { green: 0, blue: 0, red: 0 };
+	room.winnerTeam = undefined;
+	room.lastPlayedCard = undefined;
+	room.timerRef = undefined;
+
+	rooms.set(code, room);
+	return room;
 }
 
 export function findPlayerInRoom(room: Room, playerId: string): Player | undefined {
