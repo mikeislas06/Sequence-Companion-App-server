@@ -74,7 +74,14 @@ export function joinRoom(code: string, playerId: string, playerName: string): Ro
 	if (room.status !== "lobby") throw new Error("Game already started");
 	if (findPlayerInRoom(room, playerId)) return room; // already in room (reconnect)
 
-	room.teams.green.players.push(makePlayer(playerId, playerName, "green"));
+	const colors: TeamColor[] = room.config.teamCount === 2 ? ["green", "blue"] : ["green", "blue", "red"];
+	const targetColor = colors.find((c) => {
+		const team = room.teams[c];
+		return team.maxPlayers === 0 || team.players.length < team.maxPlayers;
+	});
+	if (!targetColor) throw new Error("Room is full");
+
+	room.teams[targetColor].players.push(makePlayer(playerId, playerName, targetColor));
 	rooms.set(code, room);
 	return room;
 }

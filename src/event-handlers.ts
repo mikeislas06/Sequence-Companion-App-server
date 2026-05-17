@@ -142,6 +142,7 @@ export function registerHandlers(io: Server): void {
 
 				room = advanceTurn(clearTimer(afterDraw));
 				setRoom(room);
+				broadcast(io, payload.roomCode, room);
 
 				io.to(payload.roomCode).emit("card:played", {
 					playerId: socket.id,
@@ -181,6 +182,7 @@ export function registerHandlers(io: Server): void {
 				if (!replacement) throw new Error("Could not replace dead card");
 
 				setRoom(afterReplace);
+				broadcast(io, payload.roomCode, afterReplace);
 
 				if (reshuffled) io.to(payload.roomCode).emit("deck:reshuffled");
 
@@ -219,8 +221,12 @@ export function registerHandlers(io: Server): void {
 			}
 		});
 
-		socket.on("disconnect", () => {
-			// Socket.io room cleanup happens automatically on disconnect
+		socket.on("disconnecting", () => {
+			for (const roomCode of socket.rooms) {
+				if (roomCode === socket.id) continue;
+				const updated = leaveRoom(roomCode, socket.id);
+				if (updated) broadcast(io, roomCode, updated);
+			}
 		});
 	});
 }
