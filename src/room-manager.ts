@@ -1,13 +1,17 @@
+import { randomInt } from "crypto";
 import { GameConfig, Player, PublicPlayer, PublicRoom, PublicTeam, Room, TeamColor } from "./types";
 
 const rooms = new Map<string, Room>();
 const CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const VALID_3_TEAMS_COUNTS = new Set([3, 6, 9, 12]);
+const MAX_ROOMS = 500;
+const ROOM_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
 function generateCode(): string {
 	let code = "";
 	for (let i = 0; i < 4; i++) {
-		code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+		code += CODE_CHARS[randomInt(CODE_CHARS.length)];
 	}
 	return code;
 }
@@ -27,7 +31,13 @@ function makePlayer(id: string, name: string, teamColor: TeamColor): Player {
 }
 
 export function createRoom(hostId: string, hostName: string, config: GameConfig): Room {
-	const code = generateCode();
+	if (rooms.size >= MAX_ROOMS) throw new Error("Server is at capacity. Try again later.");
+
+	let code: string;
+	do {
+		code = generateCode();
+	} while (rooms.has(code));
+
 	const room: Room = {
 		code,
 		hostId,
@@ -55,6 +65,7 @@ export function createRoom(hostId: string, hostName: string, config: GameConfig)
 		deck: [],
 		discardPile: [],
 		sequences: { green: 0, blue: 0, red: 0 },
+		lastActivity: Date.now(),
 	};
 
 	rooms.set(code, room);
@@ -66,7 +77,7 @@ export function getRoom(code: string): Room | undefined {
 }
 
 export function setRoom(room: Room): void {
-	rooms.set(room.code, room);
+	rooms.set(room.code, { ...room, lastActivity: Date.now() });
 }
 
 export function joinRoom(code: string, playerId: string, playerName: string): Room {
@@ -83,22 +94,23 @@ export function joinRoom(code: string, playerId: string, playerName: string): Ro
 	if (!targetColor) throw new Error("Room is full");
 
 	room.teams[targetColor].players.push(makePlayer(playerId, playerName, targetColor));
-	rooms.set(code, room);
+	setRoom(room);
 	return room;
 }
 
 export function joinTeam(code: string, playerId: string, teamColor: TeamColor): Room {
 	const room = rooms.get(code);
-
 	if (!room) throw new Error("Room not found");
 
-	const target = room.teams[teamColor];
+	const player = findPlayerInRoom(room, playerId);
+	if (!player) throw new Error("Player not in room");
 
+	if (player.teamColor === teamColor) return room; // already on this team
+
+	const target = room.teams[teamColor];
 	if (target.maxPlayers > 0 && target.players.length >= target.maxPlayers) {
 		throw new Error("Team is full");
 	}
-
-	const player = findPlayerInRoom(room, playerId) ?? makePlayer(playerId, "", teamColor);
 
 	// Remove from current team
 	for (const color of Object.keys(room.teams) as TeamColor[]) {
@@ -107,7 +119,7 @@ export function joinTeam(code: string, playerId: string, teamColor: TeamColor): 
 
 	player.teamColor = teamColor;
 	target.players.push(player);
-	rooms.set(code, room);
+	setRoom(room);
 	return room;
 }
 
@@ -129,7 +141,7 @@ export function leaveRoom(code: string, playerId: string): Room | null {
 		room.hostId = remaining[0].id;
 	}
 
-	rooms.set(code, room);
+	setRoom(room);
 	return room;
 }
 
@@ -211,7 +223,7 @@ export function resetRoom(code: string): Room {
 	room.lastPlayedCard = undefined;
 	room.timerRef = undefined;
 
-	rooms.set(code, room);
+	setRoom(room);
 	return room;
 }
 
@@ -222,3 +234,14 @@ export function findPlayerInRoom(room: Room, playerId: string): Player | undefin
 	}
 	return undefined;
 }
+
+// Evict rooms idle longer than ROOM_TTL_MS
+setInterval(() => {
+	const now = Date.now();
+	for (const [code, room] of rooms) {
+		if (now - room.lastActivity > ROOM_TTL_MS) {
+			if (room.timerRef) clearInterval(room.timerRef);
+			rooms.delete(code);
+		}
+	}
+}, CLEANUP_INTERVAL_MS).unref();

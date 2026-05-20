@@ -49,6 +49,7 @@ export interface Room {
 	winnerTeam?: TeamColor;
 	sequences: Record<TeamColor, number>;
 	timerRef?: ReturnType<typeof setInterval>;
+	lastActivity: number;
 }
 
 // Safe public shape — never includes hand contents

@@ -34,8 +34,9 @@ describe("joinTeam", () => {
 	});
 
 	it("throws when target team is full", () => {
-		const room = createRoom("h1", "Alice", { ...cfg2, maxPlayersPerTeam: 1 });
-		expect(() => joinTeam(room.code, "h1", "green")).toThrow("full");
+		let room = createRoom("h1", "Alice", { ...cfg2, maxPlayersPerTeam: 1 });
+		room = joinRoom(room.code, "p2", "Bob"); // auto-routes p2 to blue
+		expect(() => joinTeam(room.code, "p2", "green")).toThrow("full"); // green is full (h1)
 	});
 });
 

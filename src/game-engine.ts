@@ -1,3 +1,4 @@
+import { randomInt } from "crypto";
 import { Card, JackType, Rank, Room, Suit, TeamColor } from "./types";
 import { findPlayerInRoom } from "./room-manager";
 
@@ -43,7 +44,7 @@ function buildDeck(): Card[] {
 function shuffle<T>(arr: T[]): T[] {
 	const result = [...arr];
 	for (let i = result.length - 1; i > 0; i--) {
-		const j = Math.floor(Math.random() * (i + 1));
+		const j = randomInt(i + 1);
 		[result[i], result[j]] = [result[j], result[i]];
 	}
 	return result;
