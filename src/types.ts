@@ -13,7 +13,8 @@ export interface Card {
 }
 
 export interface Player {
-	id: string; // socket.id
+	id: string;       // stable UUID — persists across reconnects
+	socketId: string; // current transport socket — changes on reconnect
 	name: string;
 	teamColor: TeamColor;
 	hand: Card[];

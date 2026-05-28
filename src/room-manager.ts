@@ -20,9 +20,10 @@ function getActiveColors(teamCount: 2 | 3): TeamColor[] {
 	return teamCount === 2 ? ["green", "blue"] : ["green", "blue", "red"];
 }
 
-function makePlayer(id: string, name: string, teamColor: TeamColor): Player {
+function makePlayer(id: string, socketId: string, name: string, teamColor: TeamColor): Player {
 	return {
 		id,
+		socketId,
 		name,
 		teamColor,
 		hand: [],
@@ -30,7 +31,7 @@ function makePlayer(id: string, name: string, teamColor: TeamColor): Player {
 	};
 }
 
-export function createRoom(hostId: string, hostName: string, config: GameConfig): Room {
+export function createRoom(socketId: string, stableId: string, hostName: string, config: GameConfig): Room {
 	if (rooms.size >= MAX_ROOMS) throw new Error("Server is at capacity. Try again later.");
 
 	let code: string;
@@ -40,13 +41,13 @@ export function createRoom(hostId: string, hostName: string, config: GameConfig)
 
 	const room: Room = {
 		code,
-		hostId,
+		hostId: stableId,
 		status: "lobby",
 		config,
 		teams: {
 			green: {
 				color: "green",
-				players: [makePlayer(hostId, hostName, "green")],
+				players: [makePlayer(stableId, socketId, hostName, "green")],
 				maxPlayers: config.maxPlayersPerTeam,
 			},
 			blue: {
@@ -80,11 +81,11 @@ export function setRoom(room: Room): void {
 	rooms.set(room.code, { ...room, lastActivity: Date.now() });
 }
 
-export function joinRoom(code: string, playerId: string, playerName: string): Room {
+export function joinRoom(code: string, socketId: string, stableId: string, playerName: string): Room {
 	const room = rooms.get(code);
 	if (!room) throw new Error("Room not found");
 	if (room.status !== "lobby") throw new Error("Game already started");
-	if (findPlayerInRoom(room, playerId)) return room; // already in room (reconnect)
+	if (findPlayerInRoom(room, stableId)) return room; // idempotent
 
 	const colors: TeamColor[] = room.config.teamCount === 2 ? ["green", "blue"] : ["green", "blue", "red"];
 	const targetColor = colors.find((c) => {
@@ -93,16 +94,16 @@ export function joinRoom(code: string, playerId: string, playerName: string): Ro
 	});
 	if (!targetColor) throw new Error("Room is full");
 
-	room.teams[targetColor].players.push(makePlayer(playerId, playerName, targetColor));
+	room.teams[targetColor].players.push(makePlayer(stableId, socketId, playerName, targetColor));
 	setRoom(room);
 	return room;
 }
 
-export function joinTeam(code: string, playerId: string, teamColor: TeamColor): Room {
+export function joinTeam(code: string, stableId: string, teamColor: TeamColor): Room {
 	const room = rooms.get(code);
 	if (!room) throw new Error("Room not found");
 
-	const player = findPlayerInRoom(room, playerId);
+	const player = findPlayerInRoom(room, stableId);
 	if (!player) throw new Error("Player not in room");
 
 	if (player.teamColor === teamColor) return room; // already on this team
@@ -112,9 +113,8 @@ export function joinTeam(code: string, playerId: string, teamColor: TeamColor): 
 		throw new Error("Team is full");
 	}
 
-	// Remove from current team
 	for (const color of Object.keys(room.teams) as TeamColor[]) {
-		room.teams[color].players = room.teams[color].players.filter((p) => p.id !== playerId);
+		room.teams[color].players = room.teams[color].players.filter((p) => p.id !== stableId);
 	}
 
 	player.teamColor = teamColor;
@@ -123,12 +123,23 @@ export function joinTeam(code: string, playerId: string, teamColor: TeamColor): 
 	return room;
 }
 
-export function leaveRoom(code: string, playerId: string): Room | null {
+export function leaveRoom(code: string, socketId: string): Room | null {
 	const room = rooms.get(code);
 	if (!room) return null;
 
+	const player = findPlayerBySocketId(room, socketId);
+	if (!player) return null;
+
+	if (room.status === "in_game") {
+		// Transient disconnect — keep the player slot alive for rejoin
+		player.socketId = "";
+		setRoom(room);
+		return room;
+	}
+
+	// Lobby or game_over — fully remove
 	for (const color of Object.keys(room.teams) as TeamColor[]) {
-		room.teams[color].players = room.teams[color].players.filter((p) => p.id !== playerId);
+		room.teams[color].players = room.teams[color].players.filter((p) => p.id !== player.id);
 	}
 
 	const remaining = Object.values(room.teams).flatMap((t) => t.players);
@@ -137,12 +148,28 @@ export function leaveRoom(code: string, playerId: string): Room | null {
 		return null;
 	}
 
-	if (room.hostId === playerId && remaining[0]) {
+	if (room.hostId === player.id && remaining[0]) {
 		room.hostId = remaining[0].id;
 	}
 
 	setRoom(room);
 	return room;
+}
+
+export function rejoinRoom(
+	code: string,
+	stableId: string,
+	newSocketId: string,
+): { room: Room; player: Player } | null {
+	const room = rooms.get(code);
+	if (!room) return null;
+
+	const player = findPlayerInRoom(room, stableId);
+	if (!player) return null;
+
+	player.socketId = newSocketId;
+	setRoom(room);
+	return { room, player };
 }
 
 export function canStartGame(room: Room): { valid: boolean; reason?: string } {
@@ -227,9 +254,17 @@ export function resetRoom(code: string): Room {
 	return room;
 }
 
-export function findPlayerInRoom(room: Room, playerId: string): Player | undefined {
+export function findPlayerInRoom(room: Room, stableId: string): Player | undefined {
 	for (const team of Object.values(room.teams)) {
-		const player = team.players.find((p) => p.id === playerId);
+		const player = team.players.find((p) => p.id === stableId);
+		if (player) return player;
+	}
+	return undefined;
+}
+
+export function findPlayerBySocketId(room: Room, socketId: string): Player | undefined {
+	for (const team of Object.values(room.teams)) {
+		const player = team.players.find((p) => p.socketId === socketId);
 		if (player) return player;
 	}
 	return undefined;

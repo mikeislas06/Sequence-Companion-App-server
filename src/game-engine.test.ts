@@ -12,8 +12,8 @@ function make2PlayerRoom(): Room {
 		showDeckCount: true,
 	};
 
-	let room = createRoom("p1", "Alice", config);
-	room = joinRoom(room.code, "p2", "Bob");
+	let room = createRoom("p1", "p1", "Alice", config);
+	room = joinRoom(room.code, "p2", "p2", "Bob");
 	room = joinTeam(room.code, "p2", "blue");
 	return room;
 }

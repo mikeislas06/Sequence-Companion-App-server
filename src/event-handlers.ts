@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { Server, Socket } from "socket.io";
 import { z } from "zod";
 import {
@@ -6,6 +7,7 @@ import {
 	joinRoom,
 	joinTeam,
 	leaveRoom,
+	rejoinRoom,
 	resetRoom,
 	canStartGame,
 	toPublicRoom,
@@ -58,6 +60,11 @@ const SequenceUpdateSchema = z.object({
 	delta: z.union([z.literal(1), z.literal(-1)]),
 });
 const GameResetSchema = z.object({ roomCode: RoomCodeSchema });
+const RejoinSchema = z.object({
+	roomCode: RoomCodeSchema,
+	playerId: z.string().uuid(),
+	playerName: PlayerNameSchema.optional(),
+});
 
 // ---------------------------------------------------------------------------
 // Rate limiting — 20 events per socket per second
@@ -77,6 +84,18 @@ function isRateLimited(socketId: string): boolean {
 	if (entry.count >= RATE_LIMIT_MAX) return true;
 	entry.count++;
 	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Stable player ID lookup — decouples socket.id from player identity
+// ---------------------------------------------------------------------------
+
+// Maps each socket connection to the stable player UUID assigned at join time.
+// Updated on every reconnect via player:rejoin.
+const socketToStableId = new Map<string, { roomCode: string; stableId: string }>();
+
+function getStableId(socketId: string): string | undefined {
+	return socketToStableId.get(socketId)?.stableId;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,9 +190,11 @@ export function registerHandlers(io: Server): void {
 		socket.on("room:create", (raw: unknown) => {
 			try {
 				const payload = CreateRoomSchema.parse(raw);
-				const room = createRoom(socket.id, payload.hostName, payload.config);
+				const stableId = randomUUID();
+				const room = createRoom(socket.id, stableId, payload.hostName, payload.config);
+				socketToStableId.set(socket.id, { roomCode: room.code, stableId });
 				socket.join(room.code);
-				socket.emit("room:created", { roomCode: room.code, playerId: socket.id });
+				socket.emit("room:created", { roomCode: room.code, playerId: stableId });
 				broadcast(io, room.code, room);
 			} catch (e) {
 				emitError(socket, e);
@@ -183,10 +204,47 @@ export function registerHandlers(io: Server): void {
 		socket.on("room:join", (raw: unknown) => {
 			try {
 				const payload = JoinRoomSchema.parse(raw);
-				const room = joinRoom(payload.roomCode, socket.id, payload.playerName);
+				const stableId = randomUUID();
+				const room = joinRoom(payload.roomCode, socket.id, stableId, payload.playerName);
+				socketToStableId.set(socket.id, { roomCode: payload.roomCode, stableId });
 				socket.join(payload.roomCode);
-				socket.emit("room:joined", { roomCode: payload.roomCode, playerId: socket.id });
+				socket.emit("room:joined", { roomCode: payload.roomCode, playerId: stableId });
 				broadcast(io, payload.roomCode, room);
+			} catch (e) {
+				emitError(socket, e);
+			}
+		});
+
+		socket.on("player:rejoin", (raw: unknown) => {
+			try {
+				const { roomCode, playerId, playerName } = RejoinSchema.parse(raw);
+
+				// Try to find the existing player slot (covers in_game and lobby)
+				const result = rejoinRoom(roomCode, playerId, socket.id);
+				if (result) {
+					socketToStableId.set(socket.id, { roomCode, stableId: playerId });
+					socket.join(roomCode);
+					socket.emit("room:joined", { roomCode, playerId });
+					// Re-send hand so the reconnected client can resume play
+					if (result.player.hand.length > 0) {
+						socket.emit("hand:dealt", { hand: result.player.hand });
+					}
+					broadcast(io, roomCode, result.room);
+					return;
+				}
+
+				// Player not found — try re-adding them to an open lobby
+				const room = getRoom(roomCode);
+				if (room && room.status === "lobby" && playerName) {
+					const rejoined = joinRoom(roomCode, socket.id, playerId, playerName);
+					socketToStableId.set(socket.id, { roomCode, stableId: playerId });
+					socket.join(roomCode);
+					socket.emit("room:joined", { roomCode, playerId });
+					broadcast(io, roomCode, rejoined);
+					return;
+				}
+
+				socket.emit("error", { message: "Room not found" });
 			} catch (e) {
 				emitError(socket, e);
 			}
@@ -195,7 +253,9 @@ export function registerHandlers(io: Server): void {
 		socket.on("team:join", (raw: unknown) => {
 			try {
 				const payload = JoinTeamSchema.parse(raw);
-				const room = joinTeam(payload.roomCode, socket.id, payload.teamColor);
+				const stableId = getStableId(socket.id);
+				if (!stableId) throw new Error("Player not in room");
+				const room = joinTeam(payload.roomCode, stableId, payload.teamColor);
 				broadcast(io, payload.roomCode, room);
 			} catch (e) {
 				emitError(socket, e);
@@ -205,9 +265,10 @@ export function registerHandlers(io: Server): void {
 		socket.on("game:start", (raw: unknown) => {
 			try {
 				const { roomCode } = GameStartSchema.parse(raw);
+				const stableId = getStableId(socket.id);
 				let room = getRoom(roomCode);
 				if (!room) throw new Error("Room not found");
-				if (socket.id !== room.hostId) throw new Error("Only the host can start the game");
+				if (stableId !== room.hostId) throw new Error("Only the host can start the game");
 
 				const { valid, reason } = canStartGame(room);
 				if (!valid) throw new Error(reason);
@@ -218,10 +279,12 @@ export function registerHandlers(io: Server): void {
 				room.status = "in_game";
 				setRoom(room);
 
-				// Send each player their private hand only
+				// Send each player their private hand via their current socket connection
 				for (const team of Object.values(room.teams)) {
 					for (const player of team.players) {
-						io.to(player.id).emit("hand:dealt", { hand: player.hand });
+						if (player.socketId) {
+							io.to(player.socketId).emit("hand:dealt", { hand: player.hand });
+						}
 					}
 				}
 
@@ -235,16 +298,17 @@ export function registerHandlers(io: Server): void {
 		socket.on("card:play", (raw: unknown) => {
 			try {
 				const payload = PlayCardSchema.parse(raw);
+				const stableId = getStableId(socket.id);
 				let room = getRoom(payload.roomCode);
 				if (!room) throw new Error("Room not found");
 
 				const current = getCurrentPlayer(room);
-				if (current?.id !== socket.id) throw new Error("Not your turn");
+				if (current?.id !== stableId) throw new Error("Not your turn");
 
-				const { room: afterPlay, card } = playCard(room, socket.id, payload.cardId);
+				const { room: afterPlay, card } = playCard(room, stableId!, payload.cardId);
 				if (!card) throw new Error("Card not found in hand");
 
-				const { room: afterDraw, drawnCard, reshuffled } = drawCard(afterPlay, socket.id);
+				const { room: afterDraw, drawnCard, reshuffled } = drawCard(afterPlay, stableId!);
 				if (!drawnCard) throw new Error("No cards remaining");
 
 				room = advanceTurn(clearTimer(afterDraw));
@@ -252,7 +316,7 @@ export function registerHandlers(io: Server): void {
 				broadcast(io, payload.roomCode, room);
 
 				io.to(payload.roomCode).emit("card:played", {
-					playerId: socket.id,
+					playerId: stableId,
 					card,
 					deckCount: room.config.showDeckCount ? room.deck.length : undefined,
 				});
@@ -262,9 +326,10 @@ export function registerHandlers(io: Server): void {
 				// Send updated hand privately to the player who drew
 				const updatedPlayer = Object.values(room.teams)
 					.flatMap((t) => t.players)
-					.find((p) => p.id === socket.id);
-				if (updatedPlayer)
+					.find((p) => p.id === stableId);
+				if (updatedPlayer) {
 					io.to(socket.id).emit("hand:updated", { hand: updatedPlayer.hand });
+				}
 
 				beginTurn(io, payload.roomCode);
 			} catch (e) {
@@ -275,18 +340,19 @@ export function registerHandlers(io: Server): void {
 		socket.on("card:dead", (raw: unknown) => {
 			try {
 				const payload = DeadCardSchema.parse(raw);
+				const stableId = getStableId(socket.id);
 				let room = getRoom(payload.roomCode);
 				if (!room) throw new Error("Room not found");
 				if (!room.config.allowDeadCards) throw new Error("Dead card rule disabled");
 
 				const current = getCurrentPlayer(room);
-				if (current?.id !== socket.id) throw new Error("Not your turn");
+				if (current?.id !== stableId) throw new Error("Not your turn");
 
 				const {
 					room: afterReplace,
 					replacement,
 					reshuffled,
-				} = replaceDeadCard(room, socket.id, payload.cardId);
+				} = replaceDeadCard(room, stableId!, payload.cardId);
 				if (!replacement) throw new Error("Could not replace dead card");
 
 				setRoom(afterReplace);
@@ -296,9 +362,10 @@ export function registerHandlers(io: Server): void {
 
 				const updatedPlayer = Object.values(afterReplace.teams)
 					.flatMap((t) => t.players)
-					.find((p) => p.id === socket.id);
-				if (updatedPlayer)
+					.find((p) => p.id === stableId);
+				if (updatedPlayer) {
 					io.to(socket.id).emit("hand:updated", { hand: updatedPlayer.hand });
+				}
 
 				io.to(payload.roomCode).emit("deck:count", { count: afterReplace.deck.length });
 			} catch (e) {
@@ -309,10 +376,11 @@ export function registerHandlers(io: Server): void {
 		socket.on("penalty:apply", (raw: unknown) => {
 			try {
 				const payload = PenaltySchema.parse(raw);
+				const stableId = getStableId(socket.id);
 				let room = getRoom(payload.roomCode);
 				if (!room) throw new Error("Room not found");
 				if (!room.config.enforceNoTableTalk) throw new Error("Table talk penalty disabled");
-				if (socket.id !== room.hostId) throw new Error("Only the host can apply penalties");
+				if (stableId !== room.hostId) throw new Error("Only the host can apply penalties");
 
 				room = applyPenalty(room, payload.targetTeam);
 				setRoom(room);
@@ -322,8 +390,11 @@ export function registerHandlers(io: Server): void {
 					reason: "No table talk violation",
 				});
 
+				// Send updated hands privately to penalised players via their current socket
 				for (const player of room.teams[payload.targetTeam].players) {
-					io.to(player.id).emit("hand:updated", { hand: player.hand });
+					if (player.socketId) {
+						io.to(player.socketId).emit("hand:updated", { hand: player.hand });
+					}
 				}
 			} catch (e) {
 				emitError(socket, e);
@@ -333,9 +404,10 @@ export function registerHandlers(io: Server): void {
 		socket.on("sequence:update", (raw: unknown) => {
 			try {
 				const { roomCode, teamColor, delta } = SequenceUpdateSchema.parse(raw);
+				const stableId = getStableId(socket.id);
 				const room = getRoom(roomCode);
 				if (!room) throw new Error("Room not found");
-				if (socket.id !== room.hostId) throw new Error("Only the host can update sequences");
+				if (stableId !== room.hostId) throw new Error("Only the host can update sequences");
 				if (room.status !== "in_game") throw new Error("Game not in progress");
 
 				room.sequences[teamColor] = Math.max(0, (room.sequences[teamColor] ?? 0) + delta);
@@ -365,9 +437,10 @@ export function registerHandlers(io: Server): void {
 		socket.on("game:reset", (raw: unknown) => {
 			try {
 				const { roomCode } = GameResetSchema.parse(raw);
+				const stableId = getStableId(socket.id);
 				const room = getRoom(roomCode);
 				if (!room) throw new Error("Room not found");
-				if (socket.id !== room.hostId) throw new Error("Only the host can reset the game");
+				if (stableId !== room.hostId) throw new Error("Only the host can reset the game");
 
 				const reset = resetRoom(roomCode);
 				broadcast(io, roomCode, reset);
@@ -387,6 +460,7 @@ export function registerHandlers(io: Server): void {
 
 		socket.on("disconnect", () => {
 			rateLimits.delete(socket.id);
+			socketToStableId.delete(socket.id);
 		});
 	});
 }

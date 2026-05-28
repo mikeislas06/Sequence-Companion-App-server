@@ -11,19 +11,19 @@ function makeRoom(teamCount: 2 | 3, perTeam: number): Room {
 		allowDeadCards: true,
 		showDeckCount: true,
 	};
-	let room = createRoom("p1", "P1", cfg);
+	let room = createRoom("p1", "p1", "P1", cfg);
 	let n = 2;
 	const colors = teamCount === 2 ? ["blue"] : ["blue", "red"];
 	for (const color of colors) {
 		for (let i = 0; i < perTeam; i++) {
-			room = joinRoom(room.code, `p${n}`, `P${n}`);
+			room = joinRoom(room.code, `p${n}`, `p${n}`, `P${n}`);
 			room = joinTeam(room.code, `p${n}`, color as "blue" | "red");
 			n++;
 		}
 	}
 	// Fill green to match perTeam
 	for (let i = 1; i < perTeam; i++) {
-		room = joinRoom(room.code, `pg${i}`, `PG${i}`);
+		room = joinRoom(room.code, `pg${i}`, `pg${i}`, `PG${i}`);
 		// stays in green by default
 	}
 	return room;
