@@ -27,7 +27,7 @@ export function winningSequencesFor(config: GameConfig): number {
 	return config.teamCount === 2 ? 2 : 1;
 }
 
-function makePlayer(id: string, socketId: string, name: string, teamColor: TeamColor): Player {
+function makePlayer(id: string, socketId: string, name: string, teamColor: TeamColor | null): Player {
 	return {
 		id,
 		socketId,
@@ -36,6 +36,16 @@ function makePlayer(id: string, socketId: string, name: string, teamColor: TeamC
 		hand: [],
 		handLimit: 0,
 	};
+}
+
+// Every player currently in the room — across all teams plus the pending pool.
+function allPlayers(room: Room): Player[] {
+	return [...Object.values(room.teams).flatMap((t) => t.players), ...room.unassigned];
+}
+
+// Total seats the room can hold: one team's cap times the number of active teams.
+function roomCapacity(config: GameConfig): number {
+	return config.maxPlayersPerTeam * config.teamCount;
 }
 
 export function createRoom(socketId: string, stableId: string, hostName: string, config: GameConfig): Room {
@@ -55,7 +65,7 @@ export function createRoom(socketId: string, stableId: string, hostName: string,
 		teams: {
 			green: {
 				color: "green",
-				players: [makePlayer(stableId, socketId, hostName, "green")],
+				players: [],
 				maxPlayers: config.maxPlayersPerTeam,
 			},
 			blue: {
@@ -69,6 +79,9 @@ export function createRoom(socketId: string, stableId: string, hostName: string,
 				maxPlayers: config.teamCount === 3 ? config.maxPlayersPerTeam : 0,
 			},
 		},
+		// The host joins the pending pool like everyone else and picks their own
+		// team — no first-come-first-serve auto-assignment.
+		unassigned: [makePlayer(stableId, socketId, hostName, null)],
 		turnOrder: [],
 		currentTurnIndex: 0,
 		deck: [],
@@ -95,14 +108,11 @@ export function joinRoom(code: string, socketId: string, stableId: string, playe
 	if (room.status !== "lobby") throw new Error("Game already started");
 	if (findPlayerInRoom(room, stableId)) return room; // idempotent
 
-	const colors: TeamColor[] = room.config.teamCount === 2 ? ["green", "blue"] : ["green", "blue", "red"];
-	const targetColor = colors.find((c) => {
-		const team = room.teams[c];
-		return team.maxPlayers === 0 || team.players.length < team.maxPlayers;
-	});
-	if (!targetColor) throw new Error("Room is full");
+	// New joiners land in the pending pool and pick their own team. The room is
+	// full once every team seat is accounted for (assigned + pending players).
+	if (allPlayers(room).length >= roomCapacity(room.config)) throw new Error("Room is full");
 
-	room.teams[targetColor].players.push(makePlayer(stableId, socketId, playerName, targetColor));
+	room.unassigned.push(makePlayer(stableId, socketId, playerName, null));
 	setRoom(room);
 	return room;
 }
@@ -121,9 +131,12 @@ export function joinTeam(code: string, stableId: string, teamColor: TeamColor): 
 		throw new Error("Team is full");
 	}
 
+	// Detach from wherever the player currently sits — another team or the
+	// pending pool — before placing them on the chosen team.
 	for (const color of Object.keys(room.teams) as TeamColor[]) {
 		room.teams[color].players = room.teams[color].players.filter((p) => p.id !== stableId);
 	}
+	room.unassigned = room.unassigned.filter((p) => p.id !== stableId);
 
 	player.teamColor = teamColor;
 	target.players.push(player);
@@ -146,9 +159,7 @@ export function markDisconnected(code: string, socketId: string): Room | null {
 	player.socketId = "";
 
 	if (room.status !== "in_game") {
-		const anyoneConnected = Object.values(room.teams)
-			.flatMap((t) => t.players)
-			.some((p) => p.socketId !== "");
+		const anyoneConnected = allPlayers(room).some((p) => p.socketId !== "");
 		if (!anyoneConnected) {
 			if (room.timerRef) clearInterval(room.timerRef);
 			rooms.delete(code);
@@ -172,8 +183,9 @@ export function leaveRoom(code: string, stableId: string): Room | null {
 	for (const color of Object.keys(room.teams) as TeamColor[]) {
 		room.teams[color].players = room.teams[color].players.filter((p) => p.id !== player.id);
 	}
+	room.unassigned = room.unassigned.filter((p) => p.id !== player.id);
 
-	const remaining = Object.values(room.teams).flatMap((t) => t.players);
+	const remaining = allPlayers(room);
 	if (remaining.length === 0) {
 		if (room.timerRef) clearInterval(room.timerRef);
 		rooms.delete(code);
@@ -212,6 +224,8 @@ export function canStartGame(room: Room): { valid: boolean; reason?: string } {
 	const sizes = colors.map((c) => room.teams[c].players.length);
 	const total = sizes.reduce((a, b) => a + b, 0);
 
+	if (room.unassigned.length > 0)
+		return { valid: false, reason: "All players must join a team before starting" };
 	if (sizes.some((s) => s === 0))
 		return { valid: false, reason: "Each team must have at least 1 player" };
 	if (!sizes.every((s) => s === sizes[0]))
@@ -228,6 +242,13 @@ export function canStartGame(room: Room): { valid: boolean; reason?: string } {
 }
 
 export function toPublicRoom(room: Room): PublicRoom {
+	const toPublicPlayer = (p: Player): PublicPlayer => ({
+		id: p.id,
+		name: p.name,
+		teamColor: p.teamColor,
+		cardCount: p.hand.length,
+	});
+
 	const allColors: TeamColor[] = ["green", "blue", "red"];
 	const teams = Object.fromEntries(
 		allColors.map((color) => {
@@ -235,14 +256,7 @@ export function toPublicRoom(room: Room): PublicRoom {
 			const publicTeam: PublicTeam = {
 				color,
 				maxPlayers: team.maxPlayers,
-				players: team.players.map(
-					(p): PublicPlayer => ({
-						id: p.id,
-						name: p.name,
-						teamColor: p.teamColor,
-						cardCount: p.hand.length,
-					}),
-				),
+				players: team.players.map(toPublicPlayer),
 			};
 			return [color, publicTeam];
 		}),
@@ -254,6 +268,7 @@ export function toPublicRoom(room: Room): PublicRoom {
 		status: room.status,
 		config: room.config,
 		teams,
+		unassigned: room.unassigned.map(toPublicPlayer),
 		currentPlayerId: room.turnOrder[room.currentTurnIndex],
 		deckCount: room.config.showDeckCount ? room.deck.length : undefined,
 		lastPlayedCard: room.lastPlayedCard,
@@ -293,19 +308,11 @@ export function resetRoom(code: string): Room {
 }
 
 export function findPlayerInRoom(room: Room, stableId: string): Player | undefined {
-	for (const team of Object.values(room.teams)) {
-		const player = team.players.find((p) => p.id === stableId);
-		if (player) return player;
-	}
-	return undefined;
+	return allPlayers(room).find((p) => p.id === stableId);
 }
 
 export function findPlayerBySocketId(room: Room, socketId: string): Player | undefined {
-	for (const team of Object.values(room.teams)) {
-		const player = team.players.find((p) => p.socketId === socketId);
-		if (player) return player;
-	}
-	return undefined;
+	return allPlayers(room).find((p) => p.socketId === socketId);
 }
 
 // Evict rooms idle longer than ROOM_TTL_MS

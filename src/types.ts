@@ -16,7 +16,9 @@ export interface Player {
 	id: string;       // stable UUID — persists across reconnects
 	socketId: string; // current transport socket — changes on reconnect
 	name: string;
-	teamColor: TeamColor;
+	// null while the player is in the pending pool (joined the room but hasn't
+	// picked a team yet). Always a concrete color once on a team / in a game.
+	teamColor: TeamColor | null;
 	hand: Card[];
 	handLimit: number;
 }
@@ -54,6 +56,9 @@ export interface Room {
 	status: RoomStatus;
 	config: GameConfig;
 	teams: Record<TeamColor, Team>;
+	// Players who have joined the room but not yet picked a team. They must all
+	// pick a team before the game can start.
+	unassigned: Player[];
 	turnOrder: string[];
 	currentTurnIndex: number;
 	deck: Card[];
@@ -75,6 +80,7 @@ export interface PublicRoom {
 	status: RoomStatus;
 	config: GameConfig;
 	teams: Record<TeamColor, PublicTeam>;
+	unassigned: PublicPlayer[];
 	currentPlayerId?: string;
 	deckCount?: number;
 	lastPlayedCard?: Card;
@@ -92,7 +98,7 @@ export interface PublicTeam {
 export interface PublicPlayer {
 	id: string;
 	name: string;
-	teamColor: TeamColor;
+	teamColor: TeamColor | null;
 	cardCount: number;
 }
 

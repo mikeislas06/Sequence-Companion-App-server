@@ -13,6 +13,7 @@ function make2PlayerRoom(): Room {
 	};
 
 	let room = createRoom("p1", "p1", "Alice", config);
+	room = joinTeam(room.code, "p1", "green"); // host picks green
 	room = joinRoom(room.code, "p2", "p2", "Bob");
 	room = joinTeam(room.code, "p2", "blue");
 	return room;

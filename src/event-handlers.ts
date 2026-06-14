@@ -150,6 +150,7 @@ const SAFE_ERRORS = new Set([
 	"Card not found in hand",
 	"No cards remaining",
 	"Could not replace dead card",
+	"All players must join a team before starting",
 	"Each team must have at least 1 player",
 	"Teams must have the same number of players",
 	"Total player count must be 3, 6, 9 or 12 for 3 teams",

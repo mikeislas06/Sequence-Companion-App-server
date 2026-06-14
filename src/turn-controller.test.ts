@@ -12,6 +12,7 @@ function makeRoom(teamCount: 2 | 3, perTeam: number): Room {
 		showDeckCount: true,
 	};
 	let room = createRoom("p1", "p1", "P1", cfg);
+	room = joinTeam(room.code, "p1", "green"); // host picks green
 	let n = 2;
 	const colors = teamCount === 2 ? ["blue"] : ["blue", "red"];
 	for (const color of colors) {
@@ -24,7 +25,7 @@ function makeRoom(teamCount: 2 | 3, perTeam: number): Room {
 	// Fill green to match perTeam
 	for (let i = 1; i < perTeam; i++) {
 		room = joinRoom(room.code, `pg${i}`, `pg${i}`, `PG${i}`);
-		// stays in green by default
+		room = joinTeam(room.code, `pg${i}`, "green");
 	}
 	return room;
 }
