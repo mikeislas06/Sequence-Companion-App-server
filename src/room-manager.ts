@@ -20,6 +20,13 @@ function getActiveColors(teamCount: 2 | 3): TeamColor[] {
 	return teamCount === 2 ? ["green", "blue"] : ["green", "blue", "red"];
 }
 
+// Sequences a team must complete to win. Standard play: 2 for 2 teams, 1 for
+// 3 teams. With 3 teams the host may opt into 2 via config.winningSequences.
+export function winningSequencesFor(config: GameConfig): number {
+	if (config.winningSequences) return config.winningSequences;
+	return config.teamCount === 2 ? 2 : 1;
+}
+
 function makePlayer(id: string, socketId: string, name: string, teamColor: TeamColor): Player {
 	return {
 		id,
@@ -42,6 +49,7 @@ export function createRoom(socketId: string, stableId: string, hostName: string,
 	const room: Room = {
 		code,
 		hostId: stableId,
+		creatorId: stableId,
 		status: "lobby",
 		config,
 		teams: {
@@ -123,27 +131,51 @@ export function joinTeam(code: string, stableId: string, teamColor: TeamColor): 
 	return room;
 }
 
-export function leaveRoom(code: string, socketId: string): Room | null {
+// Transient disconnect (socket dropped, tab backgrounded, network blip).
+// Never removes the player slot or reassigns the host — the slot is kept alive
+// so the player can rejoin and resume with full game state. Abandoned lobby /
+// game_over rooms with nobody connected are cleaned up here; in_game rooms are
+// kept (the round may still be live) and fall back to the idle TTL sweep.
+export function markDisconnected(code: string, socketId: string): Room | null {
 	const room = rooms.get(code);
 	if (!room) return null;
 
 	const player = findPlayerBySocketId(room, socketId);
 	if (!player) return null;
 
-	if (room.status === "in_game") {
-		// Transient disconnect — keep the player slot alive for rejoin
-		player.socketId = "";
-		setRoom(room);
-		return room;
+	player.socketId = "";
+
+	if (room.status !== "in_game") {
+		const anyoneConnected = Object.values(room.teams)
+			.flatMap((t) => t.players)
+			.some((p) => p.socketId !== "");
+		if (!anyoneConnected) {
+			if (room.timerRef) clearInterval(room.timerRef);
+			rooms.delete(code);
+			return null;
+		}
 	}
 
-	// Lobby or game_over — fully remove
+	setRoom(room);
+	return room;
+}
+
+// Explicit, intentional leave (the player tapped "Leave Room"). Fully removes
+// the slot, reassigns the host if needed, and deletes the room when empty.
+export function leaveRoom(code: string, stableId: string): Room | null {
+	const room = rooms.get(code);
+	if (!room) return null;
+
+	const player = findPlayerInRoom(room, stableId);
+	if (!player) return null;
+
 	for (const color of Object.keys(room.teams) as TeamColor[]) {
 		room.teams[color].players = room.teams[color].players.filter((p) => p.id !== player.id);
 	}
 
 	const remaining = Object.values(room.teams).flatMap((t) => t.players);
 	if (remaining.length === 0) {
+		if (room.timerRef) clearInterval(room.timerRef);
 		rooms.delete(code);
 		return null;
 	}
@@ -168,6 +200,9 @@ export function rejoinRoom(
 	if (!player) return null;
 
 	player.socketId = newSocketId;
+	// The original creator always reclaims host on rejoin, so a host who dropped
+	// out (and had host handed off) gets it back when they return.
+	if (stableId === room.creatorId) room.hostId = stableId;
 	setRoom(room);
 	return { room, player };
 }
@@ -222,6 +257,7 @@ export function toPublicRoom(room: Room): PublicRoom {
 		currentPlayerId: room.turnOrder[room.currentTurnIndex],
 		deckCount: room.config.showDeckCount ? room.deck.length : undefined,
 		lastPlayedCard: room.lastPlayedCard,
+		lastPlayedBy: room.lastPlayedBy,
 		sequences: room.sequences,
 		winnerTeam: room.winnerTeam,
 	};
@@ -248,7 +284,9 @@ export function resetRoom(code: string): Room {
 	room.sequences = { green: 0, blue: 0, red: 0 };
 	room.winnerTeam = undefined;
 	room.lastPlayedCard = undefined;
+	room.lastPlayedBy = undefined;
 	room.timerRef = undefined;
+	room.turnEndsAt = undefined;
 
 	setRoom(room);
 	return room;

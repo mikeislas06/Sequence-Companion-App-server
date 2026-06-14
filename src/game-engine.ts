@@ -109,7 +109,12 @@ export function playCard(
 
 	const [card] = player.hand.splice(cardIndex, 1);
 	return {
-		room: { ...room, discardPile: [...room.discardPile, card], lastPlayedCard: card },
+		room: {
+			...room,
+			discardPile: [...room.discardPile, card],
+			lastPlayedCard: card,
+			lastPlayedBy: player.name,
+		},
 		card,
 	};
 }

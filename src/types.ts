@@ -34,6 +34,10 @@ export interface GameConfig {
 	enforceNoTableTalk: boolean;
 	allowDeadCards: boolean;
 	showDeckCount: boolean;
+	// Sequences a team must complete to win. Standard play is 2 for 2 teams and
+	// 1 for 3 teams; with 3 teams the host may opt into 2 to make games longer.
+	// Optional for backward-compat — resolve with winningSequencesFor() when absent.
+	winningSequences?: 1 | 2;
 }
 
 export interface Room {
@@ -47,9 +51,12 @@ export interface Room {
 	deck: Card[];
 	discardPile: Card[];
 	lastPlayedCard?: Card;
+	lastPlayedBy?: string; // name of the player who played lastPlayedCard
 	winnerTeam?: TeamColor;
 	sequences: Record<TeamColor, number>;
 	timerRef?: ReturnType<typeof setInterval>;
+	turnEndsAt?: number; // epoch ms when the active turn timer expires (for reconnect resync)
+	creatorId: string; // stable id of the original host — immutable, used to restore host on rejoin
 	lastActivity: number;
 }
 
@@ -63,6 +70,7 @@ export interface PublicRoom {
 	currentPlayerId?: string;
 	deckCount?: number;
 	lastPlayedCard?: Card;
+	lastPlayedBy?: string;
 	sequences: Record<TeamColor, number>;
 	winnerTeam?: TeamColor;
 }

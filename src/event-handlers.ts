@@ -7,11 +7,14 @@ import {
 	joinRoom,
 	joinTeam,
 	leaveRoom,
+	markDisconnected,
 	rejoinRoom,
 	resetRoom,
 	canStartGame,
 	toPublicRoom,
 	setRoom,
+	findPlayerBySocketId,
+	winningSequencesFor,
 } from "./room-manager";
 import {
 	buildAndDealHands,
@@ -45,6 +48,7 @@ const GameConfigSchema = z.object({
 	enforceNoTableTalk: z.boolean(),
 	allowDeadCards: z.boolean(),
 	showDeckCount: z.boolean(),
+	winningSequences: z.union([z.literal(1), z.literal(2)]).optional(),
 });
 
 const CreateRoomSchema = z.object({ hostName: PlayerNameSchema, config: GameConfigSchema });
@@ -60,6 +64,7 @@ const SequenceUpdateSchema = z.object({
 	delta: z.union([z.literal(1), z.literal(-1)]),
 });
 const GameResetSchema = z.object({ roomCode: RoomCodeSchema });
+const LeaveRoomSchema = z.object({ roomCode: RoomCodeSchema });
 const RejoinSchema = z.object({
 	roomCode: RoomCodeSchema,
 	playerId: z.string().uuid(),
@@ -96,6 +101,24 @@ const socketToStableId = new Map<string, { roomCode: string; stableId: string }>
 
 function getStableId(socketId: string): string | undefined {
 	return socketToStableId.get(socketId)?.stableId;
+}
+
+// Resolves the acting player's stable id for a gameplay event. Prefers the
+// socket→id map, but falls back to locating the player by their live socketId
+// inside the room (and re-registers the map). This keeps a reconnected socket
+// able to act even if its map entry was ever lost — the failure mode behind a
+// player getting wrongly told "Not your turn" after reconnecting mid-game.
+function resolveStableId(socket: Socket, roomCode: string): string | undefined {
+	const mapped = getStableId(socket.id);
+	if (mapped) return mapped;
+
+	const room = getRoom(roomCode);
+	if (!room) return undefined;
+	const player = findPlayerBySocketId(room, socket.id);
+	if (!player) return undefined;
+
+	socketToStableId.set(socket.id, { roomCode, stableId: player.id });
+	return player.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +184,8 @@ function beginTurn(io: Server, roomCode: string) {
 	});
 
 	room.timerRef = timerRef;
+	const seconds = room.config.timer === "off" ? 0 : (room.config.timer as number);
+	room.turnEndsAt = seconds > 0 ? Date.now() + seconds * 1000 : undefined;
 	setRoom(room);
 
 	io.to(roomCode).emit("turn:started", {
@@ -168,8 +193,19 @@ function beginTurn(io: Server, roomCode: string) {
 		currentPlayerName: player.name,
 		teamColor: player.teamColor,
 		timerSetting: room.config.timer,
+		remaining: seconds,
 		deckCount: room.config.showDeckCount ? room.deck.length : undefined,
 	});
+}
+
+// Computes how many whole seconds remain on the active turn timer, for
+// resyncing a client that just reconnected. Returns the full timer length when
+// the room has no live deadline (e.g. timer disabled).
+function remainingSeconds(room: ReturnType<typeof getRoom>): number {
+	if (!room) return 0;
+	if (room.config.timer === "off") return 0;
+	if (!room.turnEndsAt) return room.config.timer as number;
+	return Math.max(0, Math.ceil((room.turnEndsAt - Date.now()) / 1000));
 }
 
 // ---------------------------------------------------------------------------
@@ -224,12 +260,44 @@ export function registerHandlers(io: Server): void {
 				if (result) {
 					socketToStableId.set(socket.id, { roomCode, stableId: playerId });
 					socket.join(roomCode);
-					socket.emit("room:joined", { roomCode, playerId });
-					// Re-send hand so the reconnected client can resume play
-					if (result.player.hand.length > 0) {
-						socket.emit("hand:dealt", { hand: result.player.hand });
+
+					const { room: rejoinedRoom, player } = result;
+					const current =
+						rejoinedRoom.status === "in_game" ? getCurrentPlayer(rejoinedRoom) : undefined;
+
+					// Single authoritative snapshot so the client can land on the right
+					// screen (lobby / game / game-over) with the full current state —
+					// crucial when the app was fully closed and reopened to "/".
+					socket.emit("session:resync", {
+						roomCode,
+						playerId,
+						room: toPublicRoom(rejoinedRoom),
+						hand: player.hand,
+						currentPlayerId: current?.id,
+						timerSetting: rejoinedRoom.config.timer,
+						remaining: remainingSeconds(rejoinedRoom),
+					});
+
+					// Also fire the granular events the in-place pages already listen
+					// for, so a same-page reconnect resumes without waiting.
+					if (player.hand.length > 0) {
+						socket.emit("hand:dealt", { hand: player.hand });
 					}
-					broadcast(io, roomCode, result.room);
+					if (current) {
+						socket.emit("turn:started", {
+							currentPlayerId: current.id,
+							currentPlayerName: current.name,
+							teamColor: current.teamColor,
+							timerSetting: rejoinedRoom.config.timer,
+							remaining: remainingSeconds(rejoinedRoom),
+							deckCount: rejoinedRoom.config.showDeckCount
+								? rejoinedRoom.deck.length
+								: undefined,
+						});
+					}
+
+					// Send the freshest room snapshot to everyone (roster, host, etc.)
+					broadcast(io, roomCode, rejoinedRoom);
 					return;
 				}
 
@@ -239,12 +307,28 @@ export function registerHandlers(io: Server): void {
 					const rejoined = joinRoom(roomCode, socket.id, playerId, playerName);
 					socketToStableId.set(socket.id, { roomCode, stableId: playerId });
 					socket.join(roomCode);
-					socket.emit("room:joined", { roomCode, playerId });
+					const player = rejoined.teams &&
+						Object.values(rejoined.teams)
+							.flatMap((t) => t.players)
+							.find((p) => p.id === playerId);
+					socket.emit("session:resync", {
+						roomCode,
+						playerId,
+						room: toPublicRoom(rejoined),
+						hand: player?.hand ?? [],
+						currentPlayerId: undefined,
+						timerSetting: rejoined.config.timer,
+						remaining: 0,
+					});
 					broadcast(io, roomCode, rejoined);
 					return;
 				}
 
-				socket.emit("error", { message: "Room not found" });
+				// The saved session points at a room that no longer exists (server
+				// restarted, room expired, or the game ended). This is an expected
+				// outcome of an auto-rejoin on app open — not a user-facing error.
+				// Tell the client to quietly drop its stale session instead.
+				socket.emit("session:invalid", { roomCode });
 			} catch (e) {
 				emitError(socket, e);
 			}
@@ -253,7 +337,7 @@ export function registerHandlers(io: Server): void {
 		socket.on("team:join", (raw: unknown) => {
 			try {
 				const payload = JoinTeamSchema.parse(raw);
-				const stableId = getStableId(socket.id);
+				const stableId = resolveStableId(socket, payload.roomCode);
 				if (!stableId) throw new Error("Player not in room");
 				const room = joinTeam(payload.roomCode, stableId, payload.teamColor);
 				broadcast(io, payload.roomCode, room);
@@ -265,7 +349,7 @@ export function registerHandlers(io: Server): void {
 		socket.on("game:start", (raw: unknown) => {
 			try {
 				const { roomCode } = GameStartSchema.parse(raw);
-				const stableId = getStableId(socket.id);
+				const stableId = resolveStableId(socket, roomCode);
 				let room = getRoom(roomCode);
 				if (!room) throw new Error("Room not found");
 				if (stableId !== room.hostId) throw new Error("Only the host can start the game");
@@ -298,7 +382,7 @@ export function registerHandlers(io: Server): void {
 		socket.on("card:play", (raw: unknown) => {
 			try {
 				const payload = PlayCardSchema.parse(raw);
-				const stableId = getStableId(socket.id);
+				const stableId = resolveStableId(socket, payload.roomCode);
 				let room = getRoom(payload.roomCode);
 				if (!room) throw new Error("Room not found");
 
@@ -340,7 +424,7 @@ export function registerHandlers(io: Server): void {
 		socket.on("card:dead", (raw: unknown) => {
 			try {
 				const payload = DeadCardSchema.parse(raw);
-				const stableId = getStableId(socket.id);
+				const stableId = resolveStableId(socket, payload.roomCode);
 				let room = getRoom(payload.roomCode);
 				if (!room) throw new Error("Room not found");
 				if (!room.config.allowDeadCards) throw new Error("Dead card rule disabled");
@@ -376,7 +460,7 @@ export function registerHandlers(io: Server): void {
 		socket.on("penalty:apply", (raw: unknown) => {
 			try {
 				const payload = PenaltySchema.parse(raw);
-				const stableId = getStableId(socket.id);
+				const stableId = resolveStableId(socket, payload.roomCode);
 				let room = getRoom(payload.roomCode);
 				if (!room) throw new Error("Room not found");
 				if (!room.config.enforceNoTableTalk) throw new Error("Table talk penalty disabled");
@@ -404,7 +488,7 @@ export function registerHandlers(io: Server): void {
 		socket.on("sequence:update", (raw: unknown) => {
 			try {
 				const { roomCode, teamColor, delta } = SequenceUpdateSchema.parse(raw);
-				const stableId = getStableId(socket.id);
+				const stableId = resolveStableId(socket, roomCode);
 				const room = getRoom(roomCode);
 				if (!room) throw new Error("Room not found");
 				if (stableId !== room.hostId) throw new Error("Only the host can update sequences");
@@ -412,7 +496,7 @@ export function registerHandlers(io: Server): void {
 
 				room.sequences[teamColor] = Math.max(0, (room.sequences[teamColor] ?? 0) + delta);
 
-				const winCount = room.config.teamCount === 2 ? 2 : 1;
+				const winCount = winningSequencesFor(room.config);
 				const activeColors: TeamColor[] =
 					room.config.teamCount === 2 ? ["green", "blue"] : ["green", "blue", "red"];
 				const winner = activeColors.find((c) => room.sequences[c] >= winCount);
@@ -437,7 +521,7 @@ export function registerHandlers(io: Server): void {
 		socket.on("game:reset", (raw: unknown) => {
 			try {
 				const { roomCode } = GameResetSchema.parse(raw);
-				const stableId = getStableId(socket.id);
+				const stableId = resolveStableId(socket, roomCode);
 				const room = getRoom(roomCode);
 				if (!room) throw new Error("Room not found");
 				if (stableId !== room.hostId) throw new Error("Only the host can reset the game");
@@ -450,10 +534,29 @@ export function registerHandlers(io: Server): void {
 			}
 		});
 
+		// Intentional leave (the player tapped "Leave Room"). Removes the slot
+		// for good, unlike a transient disconnect which preserves it for rejoin.
+		socket.on("room:leave", (raw: unknown) => {
+			try {
+				const { roomCode } = LeaveRoomSchema.parse(raw);
+				const stableId = resolveStableId(socket, roomCode);
+				if (!stableId) return;
+				const updated = leaveRoom(roomCode, stableId);
+				socketToStableId.delete(socket.id);
+				socket.leave(roomCode);
+				if (updated) broadcast(io, roomCode, updated);
+			} catch (e) {
+				emitError(socket, e);
+			}
+		});
+
 		socket.on("disconnecting", () => {
+			// A dropped socket is treated as transient: keep the player's slot so
+			// they can rejoin with full state. Permanent removal happens only via
+			// the explicit room:leave event above.
 			for (const roomCode of socket.rooms) {
 				if (roomCode === socket.id) continue;
-				const updated = leaveRoom(roomCode, socket.id);
+				const updated = markDisconnected(roomCode, socket.id);
 				if (updated) broadcast(io, roomCode, updated);
 			}
 		});

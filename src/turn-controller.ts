@@ -50,5 +50,5 @@ export function startTimer(
 
 export function clearTimer(room: Room): Room {
 	if (room.timerRef) clearInterval(room.timerRef);
-	return { ...room, timerRef: undefined };
+	return { ...room, timerRef: undefined, turnEndsAt: undefined };
 }
