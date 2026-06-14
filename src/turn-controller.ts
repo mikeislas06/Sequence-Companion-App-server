@@ -18,6 +18,20 @@ export function buildTurnOrder(room: Room): string[] {
 	return order;
 }
 
+// Picks the starting offset into the (already team-alternating) turn order based
+// on the room's startingPlayerMode. The order array is never reshuffled — only
+// where play begins changes, which keeps team alternation intact for every mode.
+export function resolveStartIndex(room: Room, order: string[]): number {
+	if (order.length === 0) return 0;
+	const mode = room.config.startingPlayerMode ?? "default";
+	if (mode === "random") return Math.floor(Math.random() * order.length);
+	if (mode === "manual") {
+		const idx = order.indexOf(room.config.startingPlayerId ?? "");
+		return idx === -1 ? 0 : idx; // -1 is guarded at game:start; fall back safely
+	}
+	return 0;
+}
+
 export function getCurrentPlayer(room: Room) {
 	const id = room.turnOrder[room.currentTurnIndex];
 	return id ? findPlayerInRoom(room, id) : undefined;

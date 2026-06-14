@@ -38,6 +38,14 @@ export interface GameConfig {
 	// 1 for 3 teams; with 3 teams the host may opt into 2 to make games longer.
 	// Optional for backward-compat — resolve with winningSequencesFor() when absent.
 	winningSequences?: 1 | 2;
+	// How the starting player is chosen. The turn order itself (team-alternating)
+	// is never reshuffled — only the starting offset into it changes.
+	//   "default" (or absent) → first green player starts (legacy behavior)
+	//   "random"  → server picks a random starting offset
+	//   "manual"  → host pre-selects the starter on the lobby (startingPlayerId)
+	startingPlayerMode?: "default" | "random" | "manual";
+	// Stable id of the host-selected starter; only used when startingPlayerMode === "manual".
+	startingPlayerId?: string;
 }
 
 export interface Room {

@@ -1,4 +1,4 @@
-import { buildTurnOrder, advanceTurn, getCurrentPlayer } from "./turn-controller";
+import { buildTurnOrder, resolveStartIndex, advanceTurn, getCurrentPlayer } from "./turn-controller";
 import { createRoom, joinRoom, joinTeam } from "./room-manager";
 import { GameConfig, Room } from "./types";
 
@@ -44,6 +44,43 @@ describe("buildTurnOrder", () => {
 		const teamOf = (id: string) =>
 			Object.values(room.teams).find((t) => t.players.some((p) => p.id === id))?.color;
 		expect(order.map(teamOf)).toEqual(["green", "blue", "red"]);
+	});
+});
+
+describe("resolveStartIndex", () => {
+	it("defaults to 0 (first green player) when mode is absent", () => {
+		const room = makeRoom(3, 2);
+		const order = buildTurnOrder(room);
+		expect(resolveStartIndex(room, order)).toBe(0);
+	});
+
+	it("returns the index of the manually selected starter without reshuffling order", () => {
+		const room = makeRoom(3, 2);
+		const order = buildTurnOrder(room);
+		const target = order[3]; // some non-first player
+		room.config.startingPlayerMode = "manual";
+		room.config.startingPlayerId = target;
+		expect(resolveStartIndex(room, order)).toBe(3);
+		expect(order).toEqual(buildTurnOrder(room)); // order itself unchanged
+	});
+
+	it("falls back to 0 when manual starter is missing from the order", () => {
+		const room = makeRoom(2, 2);
+		const order = buildTurnOrder(room);
+		room.config.startingPlayerMode = "manual";
+		room.config.startingPlayerId = "nobody";
+		expect(resolveStartIndex(room, order)).toBe(0);
+	});
+
+	it("random mode returns a valid in-range index", () => {
+		const room = makeRoom(3, 2);
+		const order = buildTurnOrder(room);
+		room.config.startingPlayerMode = "random";
+		for (let i = 0; i < 50; i++) {
+			const idx = resolveStartIndex(room, order);
+			expect(idx).toBeGreaterThanOrEqual(0);
+			expect(idx).toBeLessThan(order.length);
+		}
 	});
 });
 

@@ -25,6 +25,7 @@ import {
 } from "./game-engine";
 import {
 	buildTurnOrder,
+	resolveStartIndex,
 	advanceTurn,
 	startTimer,
 	clearTimer,
@@ -49,12 +50,19 @@ const GameConfigSchema = z.object({
 	allowDeadCards: z.boolean(),
 	showDeckCount: z.boolean(),
 	winningSequences: z.union([z.literal(1), z.literal(2)]).optional(),
+	startingPlayerMode: z.enum(["default", "random", "manual"]).optional(),
+	startingPlayerId: z.string().optional(),
 });
 
 const CreateRoomSchema = z.object({ hostName: PlayerNameSchema, config: GameConfigSchema });
 const JoinRoomSchema = z.object({ roomCode: RoomCodeSchema, playerName: PlayerNameSchema });
 const JoinTeamSchema = z.object({ roomCode: RoomCodeSchema, teamColor: TeamColorSchema });
 const GameStartSchema = z.object({ roomCode: RoomCodeSchema });
+const StartConfigSchema = z.object({
+	roomCode: RoomCodeSchema,
+	mode: z.enum(["default", "random", "manual"]),
+	startingPlayerId: z.string().optional(),
+});
 const PlayCardSchema = z.object({ roomCode: RoomCodeSchema, cardId: CardIdSchema });
 const DeadCardSchema = z.object({ roomCode: RoomCodeSchema, cardId: CardIdSchema });
 const PenaltySchema = z.object({ roomCode: RoomCodeSchema, targetTeam: TeamColorSchema });
@@ -147,6 +155,10 @@ const SAFE_ERRORS = new Set([
 	"Total player count must be 3, 6, 9 or 12 for 3 teams",
 	"Total player count must be an even number between 2 and 12 for 2 teams",
 	"Server is at capacity. Try again later.",
+	"Choose a starting player before starting the game",
+	"Only the host can set the starting player",
+	"Starting player can only be set in the lobby",
+	"Selected starting player must be on a team",
 ]);
 
 function emitError(socket: Socket, e: unknown): void {
@@ -357,9 +369,16 @@ export function registerHandlers(io: Server): void {
 				const { valid, reason } = canStartGame(room);
 				if (!valid) throw new Error(reason);
 
+				const order = buildTurnOrder(room);
+				if ((room.config.startingPlayerMode ?? "default") === "manual") {
+					const starter = room.config.startingPlayerId;
+					if (!starter || !order.includes(starter))
+						throw new Error("Choose a starting player before starting the game");
+				}
+
 				room = buildAndDealHands(room);
-				room.turnOrder = buildTurnOrder(room);
-				room.currentTurnIndex = 0;
+				room.turnOrder = order;
+				room.currentTurnIndex = resolveStartIndex(room, order);
 				room.status = "in_game";
 				setRoom(room);
 
@@ -374,6 +393,37 @@ export function registerHandlers(io: Server): void {
 
 				io.to(roomCode).emit("game:started", toPublicRoom(room));
 				beginTurn(io, roomCode);
+			} catch (e) {
+				emitError(socket, e);
+			}
+		});
+
+		// Host-only: choose how the starting player is picked while in the lobby.
+		// Stored on the room config and broadcast so every client reflects the
+		// selected mode / highlighted starter. A single enum keeps the modes
+		// mutually exclusive by construction.
+		socket.on("game:setStartConfig", (raw: unknown) => {
+			try {
+				const { roomCode, mode, startingPlayerId } = StartConfigSchema.parse(raw);
+				const stableId = resolveStableId(socket, roomCode);
+				const room = getRoom(roomCode);
+				if (!room) throw new Error("Room not found");
+				if (stableId !== room.hostId)
+					throw new Error("Only the host can set the starting player");
+				if (room.status !== "lobby")
+					throw new Error("Starting player can only be set in the lobby");
+				if (mode === "manual" && startingPlayerId) {
+					// Must match the same eligibility game:start enforces: the starter
+					// has to be in the turn order (i.e. on a team), not merely present
+					// in the room as an unassigned player.
+					if (!buildTurnOrder(room).includes(startingPlayerId))
+						throw new Error("Selected starting player must be on a team");
+				}
+
+				room.config.startingPlayerMode = mode;
+				room.config.startingPlayerId = mode === "manual" ? startingPlayerId : undefined;
+				setRoom(room);
+				broadcast(io, roomCode, room);
 			} catch (e) {
 				emitError(socket, e);
 			}
