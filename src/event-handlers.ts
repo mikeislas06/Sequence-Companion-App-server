@@ -563,6 +563,14 @@ export function registerHandlers(io: Server): void {
 
 				if (winner) {
 					io.to(roomCode).emit("game:over", { winnerTeam: winner });
+				} else if (delta === 1) {
+					// A team just completed a (non-winning) sequence — announce it to
+					// the whole room. A winning sequence is skipped here because the
+					// game:over transition takes over the screen instead.
+					io.to(roomCode).emit("sequence:completed", {
+						teamColor,
+						count: room.sequences[teamColor],
+					});
 				}
 			} catch (e) {
 				emitError(socket, e);
